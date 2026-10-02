@@ -22,9 +22,35 @@ public class FaasRuntime {
         this.instanceManager = instanceManager;
     }
 
-    /** 发布函数新版本，历史版本不可覆盖 */
+    /**
+     * 老发布方式：共享处理器 + 遗留容量（未显式配置容量），行为与旧版一致。
+     */
     public PublishResult publish(String functionName, int version, FunctionHandler handler) {
         return registry.publish(functionName, version, handler);
+    }
+
+    /**
+     * 发布无状态函数版本：所有实例共享同一处理器，按版本配置容量。
+     *
+     * @param maxWarmInstances          该版本最多保留的暖实例数，null 取默认值
+     * @param maxConcurrencyPerInstance 单实例允许的并发调用数，null 取默认值
+     */
+    public PublishResult publish(String functionName, int version, FunctionHandler handler,
+                                 Integer maxWarmInstances, Integer maxConcurrencyPerInstance) {
+        return registry.publish(functionName, version, handler,
+                maxWarmInstances, maxConcurrencyPerInstance);
+    }
+
+    /**
+     * 发布有状态函数版本：每个冷启动实例通过工厂独立创建处理器，实例级状态隔离。
+     *
+     * @param maxWarmInstances          该版本最多保留的暖实例数，null 取默认值
+     * @param maxConcurrencyPerInstance 单实例允许的并发调用数，null 取默认值
+     */
+    public PublishResult publish(String functionName, int version, FunctionHandlerFactory factory,
+                                 Integer maxWarmInstances, Integer maxConcurrencyPerInstance) {
+        return registry.publish(functionName, version, factory,
+                maxWarmInstances, maxConcurrencyPerInstance);
     }
 
     /**
@@ -37,17 +63,21 @@ public class FaasRuntime {
         return invoker.invoke(functionName, version, input, idempotencyKey);
     }
 
-    /** 当前活跃实例数 */
+    /** 当前健康暖实例数 */
     public int activeInstances() {
         return instanceManager.activeInstances();
     }
 
-    /** 运行时指标：活跃实例数、冷启动次数、暖实例命中次数 */
+    /** 运行时指标：实例数、冷启动、暖命中、故障淘汰、容量拒绝及按版本的实例明细 */
     public Map<String, Object> metrics() {
         Map<String, Object> metrics = new LinkedHashMap<>();
         metrics.put("activeInstances", instanceManager.activeInstances());
+        metrics.put("drainingInstances", instanceManager.drainingInstances());
         metrics.put("coldStarts", instanceManager.coldStartCount());
         metrics.put("warmHits", instanceManager.warmHitCount());
+        metrics.put("evictedInstances", instanceManager.evictedCount());
+        metrics.put("capacityRejections", instanceManager.capacityRejectionCount());
+        metrics.put("pools", instanceManager.poolSizes());
         return metrics;
     }
 

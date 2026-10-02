@@ -12,8 +12,10 @@ public enum InvocationStatus {
     TIMEOUT,
     /** 函数执行体抛出异常 */
     HANDLER_ERROR,
-    /** 超出函数级并发上限，调用被拒绝 */
+    /** 超出函数级并发上限（未显式配置容量的老函数），调用被拒绝 */
     CONCURRENCY_LIMIT_EXCEEDED,
+    /** 版本暖实例数或单实例并发已达上限（按版本显式配置容量），立即拒绝不排队 */
+    INSTANCE_CAPACITY_EXCEEDED,
     /** 入参非法（如函数名为空、版本号非法、超时配置非法等） */
     INVALID_ARGUMENT,
     /** 函数不存在 */
