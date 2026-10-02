@@ -24,8 +24,12 @@ import java.util.concurrent.locks.ReentrantLock;
 @Component
 public class FunctionRegistry {
 
-    /** 每个函数的版本表：版本号 -> 处理器，条目一经写入不可变 */
-    private final ConcurrentMap<String, ConcurrentMap<Integer, FunctionHandler>> functions =
+    /** 一次发布的登记内容：处理器与该版本的容量配置（容量配置为 null 表示沿用老行为） */
+    public record Registration(FunctionHandler handler, CapacityConfig capacity) {
+    }
+
+    /** 每个函数的版本表：版本号 -> 登记内容，条目一经写入不可变 */
+    private final ConcurrentMap<String, ConcurrentMap<Integer, Registration>> functions =
             new ConcurrentHashMap<>();
     /** 每个函数的当前生效版本（已发布的最大版本号） */
     private final ConcurrentMap<String, AtomicInteger> currentVersions = new ConcurrentHashMap<>();
@@ -33,9 +37,17 @@ public class FunctionRegistry {
     private final ConcurrentMap<String, ReentrantLock> publishLocks = new ConcurrentHashMap<>();
 
     /**
-     * 发布函数的一个新版本。
+     * 发布函数的一个新版本（不配置容量，沿用老行为）。
      */
     public PublishResult publish(String functionName, int version, FunctionHandler handler) {
+        return publish(functionName, version, handler, null);
+    }
+
+    /**
+     * 发布函数的一个新版本，并显式配置该版本的暖实例容量。
+     */
+    public PublishResult publish(String functionName, int version, FunctionHandler handler,
+                                 CapacityConfig capacity) {
         if (functionName == null || functionName.isBlank()) {
             return PublishResult.rejected(PublishStatus.INVALID_ARGUMENT, functionName, version,
                     "functionName must not be blank");
@@ -48,6 +60,11 @@ public class FunctionRegistry {
             return PublishResult.rejected(PublishStatus.INVALID_ARGUMENT, functionName, version,
                     "handler must not be null");
         }
+        if (capacity != null && (capacity.maxWarmInstances() <= 0
+                || capacity.maxConcurrencyPerInstance() <= 0)) {
+            return PublishResult.rejected(PublishStatus.INVALID_ARGUMENT, functionName, version,
+                    "capacity limits must be positive integers: " + capacity);
+        }
 
         ReentrantLock lock = publishLocks.computeIfAbsent(functionName, k -> new ReentrantLock());
         if (!lock.tryLock()) {
@@ -56,10 +73,11 @@ public class FunctionRegistry {
                     "concurrent publish in progress for function '" + functionName + "', retry later");
         }
         try {
-            ConcurrentMap<Integer, FunctionHandler> versions =
+            ConcurrentMap<Integer, Registration> versions =
                     functions.computeIfAbsent(functionName, k -> new ConcurrentHashMap<>());
-            // 原子写入：版本号与处理器同时可见，且已存在时不会覆盖历史版本
-            FunctionHandler previous = versions.putIfAbsent(version, handler);
+            // 原子写入：版本号、处理器、容量同时可见，且已存在时不会覆盖历史版本
+            Registration previous = versions.putIfAbsent(
+                    version, new Registration(handler, capacity));
             if (previous != null) {
                 return PublishResult.rejected(PublishStatus.DUPLICATE_VERSION, functionName, version,
                         "version " + version + " of function '" + functionName + "' already exists");
@@ -73,12 +91,19 @@ public class FunctionRegistry {
     }
 
     /**
-     * 查询指定版本的处理器；version <= 0 表示当前生效版本（已发布的最大版本号）。
+     * 查询指定版本的登记内容（处理器 + 容量配置）；version <= 0 表示当前生效版本。
      */
-    public Optional<FunctionHandler> lookup(String functionName, int version) {
+    public Optional<Registration> lookupRegistration(String functionName, int version) {
         return resolveVersion(functionName, version)
                 .flatMap(v -> Optional.ofNullable(functions.get(functionName))
                         .map(versions -> versions.get(v)));
+    }
+
+    /**
+     * 查询指定版本的处理器；version <= 0 表示当前生效版本（已发布的最大版本号）。
+     */
+    public Optional<FunctionHandler> lookup(String functionName, int version) {
+        return lookupRegistration(functionName, version).map(Registration::handler);
     }
 
     /**
@@ -92,7 +117,7 @@ public class FunctionRegistry {
             AtomicInteger current = currentVersions.get(functionName);
             return current == null || current.get() <= 0 ? Optional.empty() : Optional.of(current.get());
         }
-        ConcurrentMap<Integer, FunctionHandler> versions = functions.get(functionName);
+        ConcurrentMap<Integer, Registration> versions = functions.get(functionName);
         return versions != null && versions.containsKey(version) ? Optional.of(version) : Optional.empty();
     }
 

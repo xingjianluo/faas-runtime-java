@@ -22,9 +22,21 @@ public class FaasRuntime {
         this.instanceManager = instanceManager;
     }
 
-    /** 发布函数新版本，历史版本不可覆盖 */
+    /** 发布函数新版本（沿用默认容量行为），历史版本不可覆盖 */
     public PublishResult publish(String functionName, int version, FunctionHandler handler) {
         return registry.publish(functionName, version, handler);
+    }
+
+    /**
+     * 发布函数新版本并显式配置暖实例容量：
+     * 最多保留 {@code maxWarmInstances} 个实例，单实例最多
+     * {@code maxConcurrencyPerInstance} 个并发调用，到顶立即拒绝。
+     * 历史版本不可覆盖。
+     */
+    public PublishResult publish(String functionName, int version, FunctionHandler handler,
+                                 int maxWarmInstances, int maxConcurrencyPerInstance) {
+        return registry.publish(functionName, version, handler,
+                new CapacityConfig(maxWarmInstances, maxConcurrencyPerInstance));
     }
 
     /**
@@ -42,12 +54,14 @@ public class FaasRuntime {
         return instanceManager.activeInstances();
     }
 
-    /** 运行时指标：活跃实例数、冷启动次数、暖实例命中次数 */
+    /** 运行时指标：活跃实例数、冷启动次数、暖实例命中次数、故障淘汰次数 */
     public Map<String, Object> metrics() {
         Map<String, Object> metrics = new LinkedHashMap<>();
         metrics.put("activeInstances", instanceManager.activeInstances());
         metrics.put("coldStarts", instanceManager.coldStartCount());
         metrics.put("warmHits", instanceManager.warmHitCount());
+        metrics.put("evictions", instanceManager.evictionCount());
+        metrics.put("activeInstanceDetails", instanceManager.activeInstanceDetails());
         return metrics;
     }
 

@@ -52,7 +52,7 @@ public class IdempotencyStore {
     }
 
     /**
-     * 调用在执行前被拒绝（如并发超限）时使用：先把拒绝结果告知等待者，
+     * 调用在执行前被拒绝（并发/容量打满）时使用：先把拒绝结果告知等待者，
      * 再驱逐该键，使后续同键调用可以重新尝试执行而不是永远回放拒绝结果。
      */
     public void completeAndEvict(String idempotencyKey, InvocationResult result) {
@@ -60,6 +60,15 @@ public class IdempotencyStore {
         if (future != null) {
             future.complete(result);
         }
+    }
+
+    /**
+     * 判定某结果是否属于“执行前因容量/并发被拒”。
+     * 被拒结果：不是成功、不算幂等成功回放、必须驱逐幂等键，绝不能伪装成成功回放。
+     */
+    public static boolean isPreExecutionRejection(InvocationResult result) {
+        return result.status() == InvocationStatus.CONCURRENCY_LIMIT_EXCEEDED
+                || result.status() == InvocationStatus.INSTANCE_CAPACITY_EXCEEDED;
     }
 
     /** 测试与指标用：当前记录的幂等键数量 */
