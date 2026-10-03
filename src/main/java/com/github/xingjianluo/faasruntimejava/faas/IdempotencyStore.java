@@ -14,8 +14,10 @@ import java.util.concurrent.ConcurrentMap;
  * <ul>
  *   <li>同一幂等键只会有一个调用真正执行函数（副作用只发生一次）；</li>
  *   <li>执行期间到达的同键调用阻塞等待，执行完成后拿到与首次调用相同的结果；</li>
- *   <li>执行完成后的同键调用立即回放首次结果，状态标记为
- *       {@link InvocationStatus#IDEMPOTENT_REPLAY}。</li>
+ *   <li>执行完成后的同键调用立即回放首次结果：首次成功标记为
+ *       {@link InvocationStatus#IDEMPOTENT_REPLAY}，首次失败（超时/异常）
+ *       标记为 {@link InvocationStatus#IDEMPOTENT_REPLAY_FAILED}，
+ *       回放与首次在成败上保持一致。</li>
  * </ul>
  */
 @Component

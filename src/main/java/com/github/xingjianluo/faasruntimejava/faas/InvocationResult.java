@@ -16,7 +16,9 @@ public record InvocationResult(
 
     /**
      * 是否按“成功”计：只有真正执行成功（SUCCESS）或命中成功结果的幂等回放
-     * （IDEMPOTENT_REPLAY）才算成功。容量/并发被拒、超时、执行异常一律不算成功。
+     * （IDEMPOTENT_REPLAY）才算成功。容量/并发被拒、超时、执行异常一律不算成功；
+     * 命中失败结果的幂等回放（IDEMPOTENT_REPLAY_FAILED）与首次失败保持一致，
+     * 同样不算成功。
      */
     public boolean success() {
         return status == InvocationStatus.SUCCESS || status == InvocationStatus.IDEMPOTENT_REPLAY;

@@ -32,8 +32,11 @@ import java.util.concurrent.TimeoutException;
  * <p>幂等与容量交叉的判定：
  * <ul>
  *   <li>同一幂等键并发进入，只有一个调用真正执行，其余等待并拿到同一结果；</li>
- *   <li>真正命中回放时包装为 {@link InvocationStatus#IDEMPOTENT_REPLAY}，
+ *   <li>首次执行<b>成功</b>：命中回放包装为 {@link InvocationStatus#IDEMPOTENT_REPLAY}，
  *       保留可识别性，且按成功计；</li>
+ *   <li>首次执行<b>失败</b>（超时/异常）：命中回放包装为
+ *       {@link InvocationStatus#IDEMPOTENT_REPLAY_FAILED}，与首次成败一致、
+ *       不算成功，但仍是可识别的回放（区别于“被拒”与“首次失败”本身）；</li>
  *   <li>若首个调用因容量/并发被拒，等待者拿到的是<b>原始被拒状态</b>
  *       （不包装成回放、不算成功），键同时被驱逐，后续同键调用可重新尝试。</li>
  * </ul>
@@ -109,8 +112,21 @@ public class FunctionInvoker {
                             first.status(), null, first.errorMessage(),
                             false, null, elapsedMillis(start));
                 }
+                if (first.status() == InvocationStatus.SUCCESS) {
+                    // 首次成功：成功回放，按成功计
+                    log.info("[调用判定] invocationId={} 同键={} 命中成功结果回放 status={}",
+                            invocationId, idempotencyKey, InvocationStatus.IDEMPOTENT_REPLAY);
+                    return InvocationResult.of(invocationId, functionName, actualVersion,
+                            InvocationStatus.IDEMPOTENT_REPLAY, first.value(), first.errorMessage(),
+                            first.coldStart(), first.instanceId(), elapsedMillis(start));
+                }
+                // 首次执行失败（超时/异常）：失败回放，与首次成败一致，不算成功，
+                // 保留首次的失败信息便于识别，但状态与“被拒”“首次失败”都可区分
+                log.info("[调用判定] invocationId={} 同键={} 命中失败结果回放 首次status={} 回放status={}",
+                        invocationId, idempotencyKey, first.status(),
+                        InvocationStatus.IDEMPOTENT_REPLAY_FAILED);
                 return InvocationResult.of(invocationId, functionName, actualVersion,
-                        InvocationStatus.IDEMPOTENT_REPLAY, first.value(), first.errorMessage(),
+                        InvocationStatus.IDEMPOTENT_REPLAY_FAILED, first.value(), first.errorMessage(),
                         first.coldStart(), first.instanceId(), elapsedMillis(start));
             }
         }

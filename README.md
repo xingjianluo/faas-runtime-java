@@ -85,16 +85,27 @@ REST 入口 `FaasController` 仅用于本地验证，核心逻辑均可脱离 HT
 
 - 同一 `idempotencyKey` 并发进入时，只有一个调用真正执行函数（副作用一次）；
   其余调用等待首个结果。
-- **真正命中回放**：包装为 `IDEMPOTENT_REPLAY`，返回值、错误、`coldStart`、
+- **首次执行成功，命中回放**：包装为 `IDEMPOTENT_REPLAY`，返回值、`coldStart`、
   `instanceId` 与首次一致，保留可识别性，且按成功计（`success()=true`）。
+- **首次执行失败（超时 `TIMEOUT` / 异常 `HANDLER_ERROR`），命中回放**：
+  包装为 `IDEMPOTENT_REPLAY_FAILED`——
+  - 与首次在成败上**严格一致**：`success()=false`，绝不会被算成成功；
+  - 仍是可识别的“回放”：状态本身说明“函数体只执行过一次、本次是结果回放”，
+    与首次失败状态（`TIMEOUT`/`HANDLER_ERROR`）区分开；
+  - 保留首次的 `errorMessage`，失败原因可追溯；`value` 与首次一致（通常为 null）；
+  - 同键并发时同样适用：执行那次拿到原始失败状态，所有等待者拿到
+    `IDEMPOTENT_REPLAY_FAILED`，**不存在同一键有人看到成功、有人看到失败**。
 - **首个调用因容量/并发被拒**：
   - 等待者拿到的是**原始被拒状态**（`INSTANCE_CAPACITY_EXCEEDED` 或
     `CONCURRENCY_LIMIT_EXCEEDED`），**不包装成回放、`success()=false`**；
   - 该幂等键同时被**驱逐**，容量释放后同键调用可以真正执行一次，
     而不是永久回放“被拒绝”；
   - 被拒调用不执行函数体、不占用实例槽位。
+- **三种“非首次执行”结果两两可区分**：
+  `IDEMPOTENT_REPLAY`（回放成功结果）/ `IDEMPOTENT_REPLAY_FAILED`
+  （回放失败结果，执行过一次）/ 容量并发被拒（从未执行，键已驱逐可重试）。
 - `InvocationResult.success()` 只对 `SUCCESS` 与 `IDEMPOTENT_REPLAY` 为真，
-  因此“是否成功”的判断天然把容量/并发拒绝排除在外。
+  因此“是否成功”的判断天然把容量/并发拒绝与失败回放都排除在外。
 - 参数与版本校验在幂等登记之前完成，非法调用不占用幂等键。
 
 ### 调用结果分类一览
@@ -102,11 +113,12 @@ REST 入口 `FaasController` 仅用于本地验证，核心逻辑均可脱离 HT
 | 状态 | 含义 | success() |
 |---|---|---|
 | `SUCCESS` | 调用成功 | true |
-| `IDEMPOTENT_REPLAY` | 命中幂等键，回放首次结果，未重复执行 | true |
+| `IDEMPOTENT_REPLAY` | 命中幂等键，回放首次的**成功**结果，未重复执行 | true |
+| `IDEMPOTENT_REPLAY_FAILED` | 命中幂等键，回放首次的**失败**结果（超时/异常），未重复执行；保留首次错误信息 | false |
 | `TIMEOUT` | 单次执行超时，实例被淘汰 | false |
 | `HANDLER_ERROR` | 执行体抛异常（或实例初始化失败），实例被淘汰 | false |
-| `INSTANCE_CAPACITY_EXCEEDED` | 暖实例池打满（显式容量版本），立即拒绝 | false |
-| `CONCURRENCY_LIMIT_EXCEEDED` | 老函数函数级并发上限，立即拒绝 | false |
+| `INSTANCE_CAPACITY_EXCEEDED` | 暖实例池打满（显式容量版本），立即拒绝，未执行 | false |
+| `CONCURRENCY_LIMIT_EXCEEDED` | 老函数函数级并发上限，立即拒绝，未执行 | false |
 | `INVALID_ARGUMENT` / `FUNCTION_NOT_FOUND` / `VERSION_NOT_FOUND` | 参数/目标问题 | false |
 
 ## 本地验证
@@ -119,7 +131,7 @@ mvn test
 
 - `FaasRuntimeTests`（原有 4 个场景，持续保持绿色、无回归）：并发发布、
   调用超时分类、幂等重放、缩容竞争不丢不重。
-- `WarmInstanceTests`（本轮新增 4 个场景）：
+- `WarmInstanceTests`（4 个场景）：
   1. **实例状态隔离**：3 实例并发冷启动后各自只看到自己的状态；第二轮精确
      复用原实例且状态延续；发布 v2 后老版本 3 个实例原样保留并继续服务；
   2. **故障实例淘汰**：异常/超时实例立即摘除，`evictions` 计数增长，后续
@@ -131,9 +143,21 @@ mvn test
   4. **淘汰替换不丢不重**：192 次错落并发（约 1/4 注入异常/超时），断言
      成功+异常+超时+拒绝的分类总数严格等于调用数，成功执行体次数等于
      成功调用数，实例数始终不超过上限，且存在暖复用与冷启动替换。
+- `IdempotentFailureReplayTests`（本轮新增 4 个场景，日志标签
+  `[失败回放-异常]` / `[失败回放-超时]` / `[并发失败一致]` / `[回放分类对照]`）：
+  1. **首次异常后同键回放**：首次 `HANDLER_ERROR`，同键回放必须是
+     `IDEMPOTENT_REPLAY_FAILED`、`success()=false`、保留首次错误信息，
+     函数体只执行一次，多次回放结论稳定；
+  2. **首次超时后同键回放**：首次 `TIMEOUT`，同键回放同样是
+     `IDEMPOTENT_REPLAY_FAILED` 且不重复执行；
+  3. **同键并发且执行那次失败**：8 个并发同键调用，恰好 1 个拿到原始
+     `HANDLER_ERROR`、其余 7 个全部 `IDEMPOTENT_REPLAY_FAILED`，
+     没有任何一个拿到成功，错误信息一致，函数体只执行一次；
+  4. **回放分类对照**：成功键回放仍是 `IDEMPOTENT_REPLAY` 且算成功；
+     成功回放 / 失败回放 / 容量并发被拒三种结果两两可区分。
 
-所有关键节点（冷启动、暖复用、容量拒绝、超时/异常淘汰、幂等回放/被拒原样
-传播）都在日志中打印实例 ID 与“判定路径”。
+所有关键节点（冷启动、暖复用、容量拒绝、超时/异常淘汰、幂等成功/失败回放、
+被拒原样传播）都在日志中打印实例 ID 与“判定路径”。
 
 ### 通过 REST 手工验证
 
@@ -162,6 +186,22 @@ curl -X POST localhost:8080/faas/functions/bad/versions/1 \
      -d '{"handlerType":"failing","maxWarmInstances":1,"maxConcurrencyPerInstance":1}'
 curl -X POST localhost:8080/faas/functions/bad/invoke \
      -H 'Content-Type: application/json' -d '"x"'
+
+# 幂等失败回放：同一个 idempotencyKey 调两次 failing——
+# 第一次是 HANDLER_ERROR（success=false），第二次是 IDEMPOTENT_REPLAY_FAILED
+# （success=false，errorMessage 与首次一致），绝不会被算成成功
+curl -X POST 'localhost:8080/faas/functions/bad/invoke?idempotencyKey=order-1' \
+     -H 'Content-Type: application/json' -d '"x"'
+curl -X POST 'localhost:8080/faas/functions/bad/invoke?idempotencyKey=order-1' \
+     -H 'Content-Type: application/json' -d '"x"'
+
+# 对照：成功键的回放是 IDEMPOTENT_REPLAY（success=true）
+curl -X POST localhost:8080/faas/functions/echo/versions/1 \
+     -H 'Content-Type: application/json' -d '{"handlerType":"echo"}'
+curl -X POST 'localhost:8080/faas/functions/echo/invoke?idempotencyKey=order-2' \
+     -H 'Content-Type: application/json' -d '"hello"'
+curl -X POST 'localhost:8080/faas/functions/echo/invoke?idempotencyKey=order-2' \
+     -H 'Content-Type: application/json' -d '"hello"'
 
 # 容量到顶：先发一个 sleep 占住唯一实例，第二个调用立即得到
 # INSTANCE_CAPACITY_EXCEEDED（不排队）；同键并发时被拒不回放
