@@ -14,8 +14,10 @@ import java.util.concurrent.ConcurrentMap;
  * <ul>
  *   <li>同一幂等键只会有一个调用真正执行函数（副作用只发生一次）；</li>
  *   <li>执行期间到达的同键调用阻塞等待，执行完成后拿到与首次调用相同的结果；</li>
- *   <li>执行完成后的同键调用立即回放首次结果，状态标记为
- *       {@link InvocationStatus#IDEMPOTENT_REPLAY}。</li>
+ *   <li>执行完成后的同键调用立即回放首次结果：首次成功标记为
+ *       {@link InvocationStatus#IDEMPOTENT_REPLAY}（算成功），首次失败（超时/异常）
+ *       标记为 {@link InvocationStatus#IDEMPOTENT_REPLAY_FAILURE}
+ *       （可识别为回放，但不算成功）——回放与首次在成败上严格一致。</li>
  * </ul>
  */
 @Component
@@ -69,6 +71,16 @@ public class IdempotencyStore {
     public static boolean isPreExecutionRejection(InvocationResult result) {
         return result.status() == InvocationStatus.CONCURRENCY_LIMIT_EXCEEDED
                 || result.status() == InvocationStatus.INSTANCE_CAPACITY_EXCEEDED;
+    }
+
+    /**
+     * 判定某结果是否属于“真正执行后的失败”（超时/执行体异常/实例初始化失败）。
+     * 这类结果被同键回放时必须保持失败语义：包装为
+     * {@link InvocationStatus#IDEMPOTENT_REPLAY_FAILURE}，可识别为回放但不算成功。
+     */
+    public static boolean isExecutionFailure(InvocationResult result) {
+        return result.status() == InvocationStatus.TIMEOUT
+                || result.status() == InvocationStatus.HANDLER_ERROR;
     }
 
     /** 测试与指标用：当前记录的幂等键数量 */

@@ -85,29 +85,42 @@ REST 入口 `FaasController` 仅用于本地验证，核心逻辑均可脱离 HT
 
 - 同一 `idempotencyKey` 并发进入时，只有一个调用真正执行函数（副作用一次）；
   其余调用等待首个结果。
-- **真正命中回放**：包装为 `IDEMPOTENT_REPLAY`，返回值、错误、`coldStart`、
-  `instanceId` 与首次一致，保留可识别性，且按成功计（`success()=true`）。
+- **首次执行成功，命中回放**：包装为 `IDEMPOTENT_REPLAY`，返回值、错误、
+  `coldStart`、`instanceId` 与首次一致，保留可识别性，且按成功计
+  （`success()=true`）。
+- **首次执行失败（超时 `TIMEOUT` / 执行异常 `HANDLER_ERROR`），命中回放**：
+  包装为 `IDEMPOTENT_REPLAY_FAILURE`——
+  - 与首次在成败上**严格一致**：`success()=false`，绝不会被算成成功；
+  - 仍可识别为回放：`replayed()=true`，与“首次执行的失败”
+    （`TIMEOUT`/`HANDLER_ERROR`）和“容量/并发被拒”都能区分开；
+  - `errorMessage`、`instanceId`、`coldStart` 与首次失败一致，`value` 为空；
+  - 失败键被**保留**（不像被拒那样驱逐），同键后续调用持续回放同一个失败，
+    不会重复执行函数体。
 - **首个调用因容量/并发被拒**：
   - 等待者拿到的是**原始被拒状态**（`INSTANCE_CAPACITY_EXCEEDED` 或
-    `CONCURRENCY_LIMIT_EXCEEDED`），**不包装成回放、`success()=false`**；
+    `CONCURRENCY_LIMIT_EXCEEDED`），**不包装成回放、`success()=false`、
+    `replayed()=false`**；
   - 该幂等键同时被**驱逐**，容量释放后同键调用可以真正执行一次，
     而不是永久回放“被拒绝”；
   - 被拒调用不执行函数体、不占用实例槽位。
 - `InvocationResult.success()` 只对 `SUCCESS` 与 `IDEMPOTENT_REPLAY` 为真，
-  因此“是否成功”的判断天然把容量/并发拒绝排除在外。
+  因此“是否成功”的判断天然把容量/并发拒绝与失败回放排除在外；
+  `InvocationResult.replayed()` 只对 `IDEMPOTENT_REPLAY` 与
+  `IDEMPOTENT_REPLAY_FAILURE` 为真，用于区分“真回放”与“被拒”。
 - 参数与版本校验在幂等登记之前完成，非法调用不占用幂等键。
 
 ### 调用结果分类一览
 
-| 状态 | 含义 | success() |
-|---|---|---|
-| `SUCCESS` | 调用成功 | true |
-| `IDEMPOTENT_REPLAY` | 命中幂等键，回放首次结果，未重复执行 | true |
-| `TIMEOUT` | 单次执行超时，实例被淘汰 | false |
-| `HANDLER_ERROR` | 执行体抛异常（或实例初始化失败），实例被淘汰 | false |
-| `INSTANCE_CAPACITY_EXCEEDED` | 暖实例池打满（显式容量版本），立即拒绝 | false |
-| `CONCURRENCY_LIMIT_EXCEEDED` | 老函数函数级并发上限，立即拒绝 | false |
-| `INVALID_ARGUMENT` / `FUNCTION_NOT_FOUND` / `VERSION_NOT_FOUND` | 参数/目标问题 | false |
+| 状态 | 含义 | success() | replayed() |
+|---|---|---|---|
+| `SUCCESS` | 调用成功 | true | false |
+| `IDEMPOTENT_REPLAY` | 命中幂等键，回放首次的**成功**结果，未重复执行 | true | true |
+| `IDEMPOTENT_REPLAY_FAILURE` | 命中幂等键，回放首次的**失败**结果（超时/异常），未重复执行 | false | true |
+| `TIMEOUT` | 单次执行超时，实例被淘汰 | false | false |
+| `HANDLER_ERROR` | 执行体抛异常（或实例初始化失败），实例被淘汰 | false | false |
+| `INSTANCE_CAPACITY_EXCEEDED` | 暖实例池打满（显式容量版本），立即拒绝 | false | false |
+| `CONCURRENCY_LIMIT_EXCEEDED` | 老函数函数级并发上限，立即拒绝 | false | false |
+| `INVALID_ARGUMENT` / `FUNCTION_NOT_FOUND` / `VERSION_NOT_FOUND` | 参数/目标问题 | false | false |
 
 ## 本地验证
 
@@ -131,6 +144,13 @@ mvn test
   4. **淘汰替换不丢不重**：192 次错落并发（约 1/4 注入异常/超时），断言
      成功+异常+超时+拒绝的分类总数严格等于调用数，成功执行体次数等于
      成功调用数，实例数始终不超过上限，且存在暖复用与冷启动替换。
+- `IdempotentFailureReplayTests`（本轮新增 2 个场景）：
+  1. **首次失败后同键串行回放**：异常与超时两类首次失败，回放均为
+     `IDEMPOTENT_REPLAY_FAILURE`（`success()=false`、`replayed()=true`、
+     错误信息保留），函数体只执行一次；失败键被保留持续回放，换键才重新执行；
+  2. **同键并发时执行那次失败**：8 个同键并发，恰好 1 个 `HANDLER_ERROR`、
+     其余全部 `IDEMPOTENT_REPLAY_FAILURE`，没有任何调用被算成成功，
+     失败原因一致，函数体只执行一次；事后同键串行调用仍回放同一失败。
 
 所有关键节点（冷启动、暖复用、容量拒绝、超时/异常淘汰、幂等回放/被拒原样
 传播）都在日志中打印实例 ID 与“判定路径”。
@@ -161,6 +181,14 @@ curl -X POST localhost:8080/faas/functions/bad/versions/1 \
      -H 'Content-Type: application/json' \
      -d '{"handlerType":"failing","maxWarmInstances":1,"maxConcurrencyPerInstance":1}'
 curl -X POST localhost:8080/faas/functions/bad/invoke \
+     -H 'Content-Type: application/json' -d '"x"'
+
+# 幂等失败回放：同一 idempotencyKey 第一次返回 HANDLER_ERROR，
+# 之后同键调用返回 IDEMPOTENT_REPLAY_FAILURE（可识别为失败回放、不算成功、
+# errorMessage 与首次一致），函数体不会重复执行
+curl -X POST 'localhost:8080/faas/functions/bad/invoke?idempotencyKey=order-1' \
+     -H 'Content-Type: application/json' -d '"x"'
+curl -X POST 'localhost:8080/faas/functions/bad/invoke?idempotencyKey=order-1' \
      -H 'Content-Type: application/json' -d '"x"'
 
 # 容量到顶：先发一个 sleep 占住唯一实例，第二个调用立即得到

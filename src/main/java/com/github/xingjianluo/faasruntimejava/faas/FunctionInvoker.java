@@ -32,8 +32,11 @@ import java.util.concurrent.TimeoutException;
  * <p>幂等与容量交叉的判定：
  * <ul>
  *   <li>同一幂等键并发进入，只有一个调用真正执行，其余等待并拿到同一结果；</li>
- *   <li>真正命中回放时包装为 {@link InvocationStatus#IDEMPOTENT_REPLAY}，
+ *   <li>首次执行<b>成功</b>时，回放包装为 {@link InvocationStatus#IDEMPOTENT_REPLAY}，
  *       保留可识别性，且按成功计；</li>
+ *   <li>首次执行<b>失败</b>（超时/异常）时，回放包装为
+ *       {@link InvocationStatus#IDEMPOTENT_REPLAY_FAILURE}：与首次在成败上严格一致，
+ *       可识别为回放，但绝不算成功；</li>
  *   <li>若首个调用因容量/并发被拒，等待者拿到的是<b>原始被拒状态</b>
  *       （不包装成回放、不算成功），键同时被驱逐，后续同键调用可重新尝试。</li>
  * </ul>
@@ -108,6 +111,14 @@ public class FunctionInvoker {
                     return InvocationResult.of(invocationId, functionName, actualVersion,
                             first.status(), null, first.errorMessage(),
                             false, null, elapsedMillis(start));
+                }
+                if (IdempotencyStore.isExecutionFailure(first)) {
+                    // 首次执行失败：回放必须保持失败语义，可识别为回放但绝不算成功
+                    log.info("[调用判定] invocationId={} 同键={} 回放首次失败结果 首次状态={} 判定路径=失败回放",
+                            invocationId, idempotencyKey, first.status());
+                    return InvocationResult.of(invocationId, functionName, actualVersion,
+                            InvocationStatus.IDEMPOTENT_REPLAY_FAILURE, null, first.errorMessage(),
+                            first.coldStart(), first.instanceId(), elapsedMillis(start));
                 }
                 return InvocationResult.of(invocationId, functionName, actualVersion,
                         InvocationStatus.IDEMPOTENT_REPLAY, first.value(), first.errorMessage(),
